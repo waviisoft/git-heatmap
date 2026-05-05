@@ -26,6 +26,18 @@ parser = argparse.ArgumentParser(description="Generate a commit heat map for a g
 parser.add_argument("repo", nargs="?", default=".", help="Path to git repo (default: current directory)")
 parser.add_argument("--out", default="", help="Output HTML path (default: temp file)")
 parser.add_argument("--no-open", action="store_true", help="Don't open browser after generating")
+parser.add_argument(
+    "--config",
+    default="",
+    help="Path to JSON config file (default: .git-heatmap.json in repo root)"
+)
+parser.add_argument(
+    "--merge",
+    action="append",
+    default=[],
+    metavar="PRIMARY:ALT1,ALT2",
+    help="Merge author names into one; repeatable. e.g. --merge 'John Doe:jdoe,j.doe'"
+)
 args = parser.parse_args()
 
 repo_path = os.path.abspath(args.repo)
@@ -65,7 +77,76 @@ repo_display = gh_repo_name or os.path.basename(repo_path)
 
 # ── Git log ───────────────────────────────────────────────────────────────────
 
-ALIAS: dict[str, str] = {}   # add known aliases here if needed
+def _find_config(explicit_path, repo_root):
+    if explicit_path:
+        return explicit_path
+    candidate = os.path.join(repo_root, ".git-heatmap.json")
+    return candidate if os.path.isfile(candidate) else None
+
+def _load_config(path):
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return json.load(fh)
+    except FileNotFoundError:
+        print(f"Error: config file not found: {path}", file=sys.stderr)
+        sys.exit(1)
+    except json.JSONDecodeError as exc:
+        print(f"Error: invalid JSON in {path}: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+def _aliases_from_config(cfg):
+    alias = {}
+    for primary, alts in cfg.get("merge_authors", {}).items():
+        if not isinstance(alts, list):
+            print(f"Warning: merge_authors[{primary!r}] must be a list, skipping", file=sys.stderr)
+            continue
+        for alt in alts:
+            if not isinstance(alt, str) or alt == primary:
+                continue
+            if alt in alias and alias[alt] != primary:
+                print(f"Warning: alias {alt!r} already mapped; keeping first mapping", file=sys.stderr)
+                continue
+            alias[alt] = primary
+    return alias
+
+def _aliases_from_cli(merge_args):
+    alias = {}
+    for token in merge_args:
+        if ":" not in token:
+            print(f"Warning: --merge {token!r} has no colon separator, skipping", file=sys.stderr)
+            continue
+        primary, _, rest = token.partition(":")
+        primary = primary.strip()
+        if not primary:
+            continue
+        for alt in (a.strip() for a in rest.split(",") if a.strip()):
+            if alt == primary:
+                continue
+            if alt in alias and alias[alt] != primary:
+                print(f"Warning: alias {alt!r} already mapped via CLI; keeping first", file=sys.stderr)
+                continue
+            alias[alt] = primary
+    return alias
+
+def _resolve_chains(alias):
+    resolved = {}
+    for src, dst in alias.items():
+        seen = {src}
+        while dst in alias and alias[dst] not in seen:
+            seen.add(dst)
+            dst = alias[dst]
+        resolved[src] = dst
+    return resolved
+
+def _build_alias(explicit_config, merge_args, repo_root):
+    alias = {}
+    cfg_path = _find_config(explicit_config, repo_root)
+    if cfg_path:
+        alias.update(_aliases_from_config(_load_config(cfg_path)))
+    alias.update(_aliases_from_cli(merge_args))
+    return _resolve_chains(alias)
+
+ALIAS = _build_alias(args.config, args.merge, repo_path)
 
 raw_log = git("log", "--format=%H\t%ad\t%an\t%s", "--date=iso-strict")
 commit_index: dict[tuple[str, str], list[dict]] = defaultdict(list)
