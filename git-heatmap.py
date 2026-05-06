@@ -232,30 +232,11 @@ while cur <= global_end:
     all_weeks.append([cur + timedelta(days=i) for i in range(7)])
     cur += timedelta(weeks=1)
 
-PADDING_WEEKS = 2
+# ── Heatmap rendering ─────────────────────────────────────────────────────────
 
-def active_range_for_year(year: int):
-    active = []
-    for wi, week in enumerate(all_weeks):
-        for d in week:
-            if d.year == year:
-                for a in authors:
-                    if commit_counts[a].get(d.isoformat(), 0) > 0:
-                        active.append(wi)
-                        break
-    if not active:
-        return None
-    return (max(0, min(active) - PADDING_WEEKS),
-            min(len(all_weeks) - 1, max(active) + PADDING_WEEKS))
-
-# ── SVG generation ────────────────────────────────────────────────────────────
-
-CELL = 10; GAP = 2; STEP = CELL + GAP
-LABEL_W = 26; DAY_LABEL_W = 10; LEFT = LABEL_W + DAY_LABEL_W
-TOP = 18; AUTHOR_GAP = 10
 MONTH_NAMES = ["", "Jan", "Feb", "Mar", "Apr", "May", "Jun",
                "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
-DAY_CHARS = "SMTWTFS"
+DAY_DISPLAY  = ["", "M", "", "W", "", "F", ""]   # only Mon/Wed/Fri labelled
 
 def commit_level(count: int) -> int:
     if count == 0: return 0
@@ -265,112 +246,139 @@ def commit_level(count: int) -> int:
     return 4
 
 
-def make_stacked_svg(wi_range: tuple[int, int]) -> str:
-    week_slice = all_weeks[wi_range[0]: wi_range[1] + 1]
-    nw = len(week_slice)
-    author_h = 7 * STEP
-    total_h = TOP + len(authors) * author_h + (len(authors) - 1) * AUTHOR_GAP + 6
-    width = LEFT + nw * STEP + 4
+def compute_rendered_weeks() -> list:
+    """Active weeks plus buffers so each year >= 3 weeks and each month >= 2 weeks."""
+    active = {
+        i for i, week in enumerate(all_weeks)
+        if any(commit_counts[a].get(d.isoformat(), 0) > 0 for a in authors for d in week)
+    }
+    included = set(active)
 
-    lines = [f'<svg width="{width}" height="{total_h}" xmlns="http://www.w3.org/2000/svg">']
+    # Year pass: ensure >= 3 weeks per year
+    for year in {all_weeks[i][0].year for i in included}:
+        idxs = [i for i, w in enumerate(all_weeks) if w[0].year == year]
+        in_y = {i for i in idxs if i in included}
+        while len(in_y) < min(3, len(idxs)):
+            cands = [i for i in idxs if i not in in_y]
+            best = min(cands, key=lambda c: min(abs(c - j) for j in in_y))
+            included.add(best)
+            in_y.add(best)
 
-    # Month labels
-    seen_months: set = set()
-    for col, week in enumerate(week_slice):
-        for d in week:
-            key = (d.year, d.month)
-            if d.day <= 7 and key not in seen_months:
-                seen_months.add(key)
-                x = LEFT + col * STEP
-                lines.append(f'<text x="{x}" y="{TOP - 4}" font-size="9" fill="#8b949e">'
-                              f'{MONTH_NAMES[d.month]}</text>')
+    # Month pass: only months that have at least 1 commit (not pure year-buffers)
+    for ym in {(all_weeks[i][0].year, all_weeks[i][0].month) for i in active}:
+        idxs = [i for i, w in enumerate(all_weeks) if (w[0].year, w[0].month) == ym]
+        in_m = {i for i in idxs if i in included}
+        while len(in_m) < min(2, len(idxs)):
+            cands = [i for i in idxs if i not in in_m]
+            best = min(cands, key=lambda c: min(abs(c - j) for j in in_m))
+            included.add(best)
+            in_m.add(best)
 
+    return [all_weeks[i] for i in sorted(included, reverse=True)]
+
+
+def render_scroll_view() -> str:
+    """Return the unified horizontally-scrolling heatmap HTML (newest week left)."""
+    rev_weeks = compute_rendered_weeks()
+    nw = len(rev_weeks)
+    parts = []
+
+    parts.append('<div id="heatmap-wrapper">')
+    parts.append('<table id="heatmap-table">')
+
+    # Compute colspan spans for the two header rows
+    year_spans  = []  # [(year, colspan), ...]
+    month_spans = []  # [((year, month), colspan), ...]
+    cy = cm = None
+    cy_cnt = cm_cnt = 0
+    for week in rev_weeks:
+        fd = week[0]
+        y, ym = fd.year, (fd.year, fd.month)
+        if y != cy:
+            if cy is not None:
+                year_spans.append((cy, cy_cnt))
+            cy, cy_cnt = y, 1
+        else:
+            cy_cnt += 1
+        if ym != cm:
+            if cm is not None:
+                month_spans.append((cm, cm_cnt))
+            cm, cm_cnt = ym, 1
+        else:
+            cm_cnt += 1
+    if cy is not None:
+        year_spans.append((cy, cy_cnt))
+    if cm is not None:
+        month_spans.append((cm, cm_cnt))
+
+    # Year row (sticky top:0, sticky left:156px)
+    parts.append('<thead>')
+    parts.append('<tr class="year-row">')
+    parts.append('<th class="corner-cell" rowspan="2" colspan="2"></th>')
+    for i, (year, span) in enumerate(year_spans):
+        sep = ' year-sep' if i > 0 else ''
+        parts.append(f'<th class="year-header{sep}" colspan="{span}">{year}</th>')
+    parts.append('</tr>')
+    # Month row (sticky top:20px)
+    parts.append('<tr class="month-row">')
+    prev_my = None
+    for (year, month), span in month_spans:
+        sep = ' year-sep' if (prev_my is not None and year != prev_my) else ''
+        prev_my = year
+        parts.append(f'<th class="month-header{sep}" colspan="{span}">{MONTH_NAMES[month]}</th>')
+    parts.append('</tr>')
+    parts.append('</thead>')
+
+    # Precompute which week indices mark a year boundary (for the separator line)
+    year_sep_indices = {
+        wi for wi in range(1, len(rev_weeks))
+        if rev_weeks[wi][0].year != rev_weeks[wi - 1][0].year
+    }
+
+    # Author rows: 7 rows per author (Sun–Sat)
+    parts.append('<tbody>')
     for ai, author in enumerate(authors):
         meta = AUTHOR_META[author]
-        ay = TOP + ai * (author_h + AUTHOR_GAP)
-
-        # Separator line
-        if ai > 0:
-            sep_y = ay - AUTHOR_GAP // 2
-            lines.append(f'<line x1="{LEFT}" y1="{sep_y}" x2="{LEFT + nw * STEP}" y2="{sep_y}" '
-                         f'stroke="#30363d" stroke-width="1"/>')
-
-        # Author initials label
-        mid_y = ay + author_h // 2 + 4
-        lines.append(f'<text x="0" y="{mid_y}" font-size="9" font-weight="700" '
-                     f'fill="{meta["accent"]}">{meta["initials"]}</text>')
-
-        # M/W/F day labels
-        for di, ch in enumerate(DAY_CHARS):
-            if di in (1, 3, 5):
-                y = ay + di * STEP + CELL - 1
-                lines.append(f'<text x="{LABEL_W}" y="{y}" font-size="9" fill="#656d76">{ch}</text>')
-
-        # Cells
-        for col, week in enumerate(week_slice):
-            for di, d in enumerate(week):
-                cnt = commit_counts[author].get(d.isoformat(), 0)
-                fill = meta["palette"][commit_level(cnt)]
-                x = LEFT + col * STEP
-                y = ay + di * STEP
+        ini  = meta["initials"]
+        ac   = meta["accent"]
+        for di in range(7):
+            parts.append('<tr class="day-row">')
+            if di == 0:
+                parts.append(
+                    f'<th class="author-cell" rowspan="7">'
+                    f'<div class="grid-avatar" style="background:{meta["avatar_bg"]}">{ini}</div>'
+                    f'</th>'
+                )
+            parts.append(f'<th class="day-cell">{DAY_DISPLAY[di]}</th>')
+            for wi, week in enumerate(rev_weeks):
+                d          = week[di]
+                cnt        = commit_counts[author].get(d.isoformat(), 0)
+                fill       = meta["palette"][commit_level(cnt)]
+                date_iso   = d.isoformat()
                 date_label = d.strftime("%b %-d, %Y")
-                tip = f"{cnt} commit{'s' if cnt != 1 else ''} on {date_label}"
-                data = (f'data-author="{author}" data-date="{d.isoformat()}" '
-                        f'data-count="{cnt}" data-label="{date_label}"')
-                cursor = 'style="cursor:pointer"' if cnt > 0 else ""
-                lines.append(f'<rect x="{x}" y="{y}" width="{CELL}" height="{CELL}" rx="2" '
-                             f'fill="{fill}" {data} {cursor} class="cell">'
-                             f'<title>{tip}</title></rect>')
+                tip        = f"{cnt} commit{'s' if cnt != 1 else ''} on {date_label}"
+                sep        = ' year-sep' if wi in year_sep_indices else ''
+                if cnt > 0:
+                    parts.append(
+                        f'<td class="cell{sep}" data-author="{author}" data-date="{date_iso}"'
+                        f' data-count="{cnt}" data-label="{date_label}"'
+                        f' title="{tip}" style="cursor:pointer;">'
+                        f'<div class="dot" style="background:{fill};"></div></td>'
+                    )
+                else:
+                    parts.append(
+                        f'<td class="cell{sep}" title="{tip}">'
+                        f'<div class="dot" style="background:{fill};"></div></td>'
+                    )
+            parts.append('</tr>')
+        if ai < len(authors) - 1:
+            parts.append(f'<tr class="author-sep"><td colspan="{nw + 2}"></td></tr>')
+    parts.append('</tbody></table></div>')
+    return "\n".join(parts)
 
-    lines.append("</svg>")
-    return "\n".join(lines)
+# ── Build scroll view ─────────────────────────────────────────────────────────
 
-# ── Build year sections ───────────────────────────────────────────────────────
-
-year_totals: dict[int, dict[str, int]] = defaultdict(lambda: defaultdict(int))
-for a in authors:
-    for ds, cnt in commit_counts[a].items():
-        year_totals[int(ds[:4])][a] += cnt
-
-all_years = sorted(year_totals.keys(), reverse=True)
-
-sections_html = []
-for year in all_years:
-    rng = active_range_for_year(year)
-    if rng is None:
-        continue
-    svg = make_stacked_svg(rng)
-    nweeks = rng[1] - rng[0] + 1
-    total_yr = sum(year_totals[year].values())
-
-    badges = []
-    for a in authors:
-        n = year_totals[year].get(a, 0)
-        if n == 0:
-            continue
-        color = AUTHOR_META[a]["accent"]
-        ini = AUTHOR_META[a]["initials"]
-        badges.append(
-            f'<span style="display:inline-flex;align-items:center;gap:5px;margin-right:12px;">'
-            f'<span style="width:10px;height:10px;border-radius:50%;background:{color};'
-            f'display:inline-block;"></span>'
-            f'<span style="color:#8b949e;font-size:12px;">{ini} '
-            f'<strong style="color:#c9d1d9">{n}</strong></span></span>'
-        )
-
-    sparse = total_yr <= 3 and year < (all_years[-1] + 2)
-    label_suffix = (" <span style='font-size:11px;color:#484f58;font-weight:400;'>"
-                    "— sparse</span>") if sparse else ""
-
-    sections_html.append(f"""
-<div class="year-section">
-  <div class="year-header">
-    <span class="year-label">{year}{label_suffix}</span>
-    <span class="year-badges">{"".join(badges)}</span>
-    <span class="year-meta">{nweeks} weeks shown · {total_yr} commit{"s" if total_yr != 1 else ""}</span>
-  </div>
-  <div class="heatmap-scroll">{svg}</div>
-</div>""")
+scroll_view = render_scroll_view()
 
 # ── Legend ────────────────────────────────────────────────────────────────────
 
@@ -470,7 +478,7 @@ function showOverlay(author, dateStr, dateLabel, rect) {
 function hideOverlay() { overlay.classList.remove('visible'); }
 
 document.addEventListener('click', e => {
-  const cell = e.target.closest('rect.cell');
+  const cell = e.target.closest('td.cell');
   if (cell) {
     if (parseInt(cell.dataset.count || '0', 10) === 0) return;
     e.stopPropagation();
@@ -482,6 +490,7 @@ document.addEventListener('click', e => {
 });
 
 document.addEventListener('keydown', e => { if (e.key === 'Escape') hideOverlay(); });
+
 """
 
 js = js.replace("__COMMIT_DATA__", commit_data_json).replace("__GH_BASE__", gh_base)
@@ -504,14 +513,21 @@ h1{{font-size:20px;font-weight:600;color:#e6edf3;margin-bottom:4px}}
 .legend-author{{display:flex;align-items:center;gap:12px}}
 .legend-avatar{{width:32px;height:32px;border-radius:50%;display:flex;align-items:center;
                justify-content:center;font-weight:700;font-size:11px;color:#fff;flex-shrink:0}}
-.year-section{{margin-bottom:20px}}
-.year-header{{display:flex;align-items:center;gap:12px;margin-bottom:6px;flex-wrap:wrap}}
-.year-label{{font-size:13px;font-weight:700;color:#e6edf3;min-width:48px}}
-.year-badges{{display:flex;align-items:center;flex-wrap:wrap}}
-.year-meta{{font-size:11px;color:#484f58;margin-left:auto}}
-.heatmap-scroll{{overflow-x:auto;background:#161b22;border:1px solid #30363d;
-                border-radius:6px;padding:12px 12px 8px}}
-.heatmap-scroll svg{{display:block}}
+#heatmap-wrapper{{overflow:auto;max-height:80vh;background:#161b22;border:1px solid #30363d;border-radius:6px;padding:8px 12px 8px 0;margin-bottom:20px}}
+#heatmap-table{{border-collapse:separate;border-spacing:0}}
+th.corner-cell{{position:sticky;top:0;left:0;z-index:5;background:#161b22;min-width:52px}}
+th.year-header{{position:sticky;top:0;left:52px;z-index:3;background:#161b22;height:20px;font-size:11px;font-weight:700;color:#e6edf3;text-align:left;white-space:nowrap;padding:0 0 3px 4px;vertical-align:bottom}}
+th.year-header.year-sep{{box-sizing:content-box;border-left:10px solid #161b22;padding-left:4px}}
+th.month-header{{position:sticky;top:20px;left:52px;z-index:3;background:#161b22;height:16px;font-size:9px;font-weight:400;color:#8b949e;text-align:left;white-space:nowrap;padding:0 0 2px 4px;vertical-align:bottom}}
+th.month-header.year-sep{{box-sizing:content-box;border-left:10px solid #161b22}}
+td.cell.year-sep{{box-sizing:content-box;border-left:10px solid #161b22}}
+th.author-cell{{position:sticky;left:0;z-index:1;background:#161b22;width:36px;min-width:36px;max-width:36px;padding:4px 4px;text-align:center;vertical-align:middle}}
+.grid-avatar{{width:28px;height:28px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-weight:700;font-size:10px;color:#fff;margin:0 auto}}
+th.day-cell{{position:sticky;left:36px;z-index:1;background:#161b22;width:16px;min-width:16px;font-size:9px;font-weight:400;color:#656d76;text-align:right;padding:0 3px 0 0}}
+td.cell{{width:12px;height:12px;padding:1px;border:none;vertical-align:top}}
+div.dot{{width:10px;height:10px;border-radius:2px}}
+tr.author-sep td{{height:10px;padding:0}}
+tr.day-row{{height:12px}}
 #overlay{{position:fixed;z-index:1000;background:#1c2128;border:1px solid #30363d;
          border-radius:8px;box-shadow:0 8px 24px rgba(0,0,0,.5);
          min-width:280px;max-width:440px;
@@ -544,7 +560,7 @@ h1{{font-size:20px;font-weight:600;color:#e6edf3;margin-bottom:4px}}
 <h1>{repo_display} — Commit Heat Map{gh_link}</h1>
 <div class="subtitle">{total_all} commits · {len(authors)} contributor{"s" if len(authors) != 1 else ""} · click any cell to see commits</div>
 <div class="legend-strip">{"".join(legend_items)}</div>
-{"".join(sections_html)}
+{scroll_view}
 <div id="overlay" role="dialog" aria-modal="true">
   <div id="overlay-header">
     <div id="overlay-title"></div>
